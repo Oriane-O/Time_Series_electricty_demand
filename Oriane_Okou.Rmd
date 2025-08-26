@@ -1,0 +1,246 @@
+---
+title: "Time Series Forecasting Exam"
+author: "Oriane Okou"
+output: github_document
+---
+
+
+
+In this Project,we will analyse the electricity consumption of a building and the outdoor air temperature over time. Our dataset contains for each timestamp every 15 minutes, the electricity consumption in kW and the outdoor air temperature in C°, from 1/1/2010 1:15 to 2/20/2010 23:45, and temperature are also available for 2/21/2010.The goal is to forecast electricity consumption for 2/21/2010.
+
+
+# 1. Forecast based on electricity consumption only
+In the first part, we will forecast the electricity consumption without using outdoor temperature:
+
+We start by loading necessary package
+```{r}
+library(readxl)
+library(forecast)
+library(ggplot2)
+library(openxlsx)
+```
+
+## Analysis of the Time Series
+We load the data and plot them.
+```{r, out.width='70%'}
+data<-readxl::read_excel("2025-06-Elec-train (1).xlsx")
+head(data)
+```
+```{r}
+power <- ts(data$`Power (kW)`,frequency = 96 ) # Frequency : 4 observations/hour * 24 hour = 96/day
+plot(power, xlab = "Time (day)")
+
+```
+We clearly see a seasonal pattern, repeated each day we highs during the day and lows during the night.We don't see any particular trend on this period, even though we can notice that the envelop of the curve slightly change over the week, maybe due to a lower consumption on the weekend. 
+
+We can also notice a large drop around day ~50 (null points). These outliers will need to be dealt with. 
+Let's further our investigation on the data to choose the best model.
+```{r}
+summary(power)
+```
+```{r}
+ggseasonplot(power, year.labels = TRUE, main = "Seasonal plot: Power consumption")
+
+```
+
+```{r}
+power_clean <- tsclean(power)  # replace the outliers
+decomp <- stl(power_clean, s.window = "periodic", robust = TRUE)
+autoplot(decomp)
+```
+
+```{r}
+ggtsdisplay(power_clean)
+```
+These graphs confirms our first observations:
+Each curve corresponds to a full day (96 points of 15 min). The daily profile is very regular:
+-Nighttime trough  around ~150–180 kW
+-Rapid rise in the morning
+-High plateau during the day (~250–320 kW)
+-Drop in the evening 
+Abnormally low or zero values are probably due to a failure or incomplete reading.
+
+ACF/PACF: strong autocorrelation at multiples of 96 → clear seasonality.
+
+## Models and Forecasting
+We start by splitting the serie into train and test.
+
+```{r}
+elec_train=window(power_clean,start=c(40,1),end=c(51,96)) # we take fewer data to test our model more quickly
+elec_test=window(power_clean,start=c(52,1))
+plot(elec_train)
+```
+First we start with Holt Winters exponential smoothing. 
+```{r}
+#fit=hw(elec_train,lambda="auto")
+#prevHW=forecast(fit,h=18)
+#autoplot(elec_test[,"Power(kW)"],series="test data")+autolayer(prevHW$mean,series="HW")
+```
+96 is a too high frequency for HW model.
+
+
+We try a SARIMA model.
+We start by differentiating the serie.
+```{r}
+power_diff96 <-(diff(power_clean, lag = 96))
+ggtsdisplay(power_diff96)
+```
+
+The seasonality has been removed.But it seems like we have a linear trend in the ACF. Let's differentiate again.
+
+```{r}
+power_diff96 <-diff(power_diff96)
+ggtsdisplay(power_diff96)
+```
+
+No more trend. No more seasonality.
+###Let's check the auto Arima:
+```{r}
+fit_auto=auto.arima( elec_train )
+fit_auto
+```
+
+We check the residuals of this SARIMA model to see if it's white noise, and in this case the model covers all the particularity of the data. In the case we see significant spikes in the PACF, we will try to change the parameters
+```{r}
+checkresiduals(fit_auto)
+pacf(fit_auto$residuals)
+```
+. 
+```{r}
+prev_auto=forecast(fit_auto,h=96)
+print(sqrt(mean((prev_auto$mean-elec_test)^2)))
+
+autoplot(elec_test)+autolayer(prev_auto$mean,series="auto SARIMA")
+
+```
+RMSE: 7.628808
+
+We didn't capture all correlations, we try to do a model manually
+
+###And no let's try it manually:
+We plot it more clearly:
+```{r}
+Pacf(power_diff96, main = "PACF - Power")
+```
+```{r}
+Acf(power_diff96, main = "ACF - Power")
+```
+
+The analysis of the autocorrelation function (ACF) and partial autocorrelation function (PACF) reveals strong dependencies at small lags (up to 4) and regular peaks at multiples of 96, indicating a daily seasonal component. The non-seasonal parameters $p=4$ and $q=2$ were selected to model these short-term correlations, while the seasonal parameters $P=2$ and $Q=1$ capture the repeating structure over 96 periods. The “last significant peak” rule was not applied, as very large lags (e.g., 192) often correspond to harmonics of the seasonality and are better modeled in the seasonal part rather than by artificially increasing $p$ or $q$, which would unnecessarily complicate the model and risk overfitting. Stationarity tests required both non-seasonal ($d=1$) and seasonal ($D=1$) differencing, leading to the final model $SARIMA(4,1,2)(2,1,1)_{96}$.
+
+
+Let's test the $SARIMA(4,1,2)(2,1,1)_{96}$ :
+After various tries of tuning a SARIMA model (changing the parameters, checking the residuals,most significant coefficient, trying to choose higher/lower parameters), we still have errors and can't find a better model due to optimization issues.
+We at last obtain this SARIMA:
+```{r}
+fit=arima(elec_train, order = c(0,1,3), seasonal = list(order = c(0,1,2), period = 96))
+fit
+```
+```{r}
+checkresiduals(fit)
+pacf(fit$residuals)
+```
+
+```{r}
+prev=forecast(fit,h=96)
+print(sqrt(mean((prev$mean-elec_test)^2)))
+
+autoplot(elec_test)+autolayer(prev$mean,series="manual SARIMA")+autolayer(prev_auto$mean,series="auto SARIMA")
+
+```
+
+Comparing the AIC, we stay with our manual forecast even though it's not the best one and it don't contain every auto correlations.
+````{r}
+df <- data.frame(
+  date = time(prev$mean),           
+  value = as.numeric(prev$mean)     
+)
+
+# Save in CSV
+write.csv(df, "elec_1.csv", row.names = FALSE)
+
+````
+
+# 2. Forecast based on electricity consumption and outdoor temperature
+
+We will use a dynamic regression model for forecasting electricity demand, using temperature as an external covariate. The order of the ARIMA model for the residual part is automatically selected
+```{r}
+power <- ts(data$`Power (kW)`, frequency = 96)
+power_clean<-tsclean(power) # to clean the outliers
+data$power<-power_clean
+data
+```
+```{r}
+autoplot(ts(data$power, frequency = 96),series="Power_cleaned")+autolayer(ts(data$`Temp (C°)`, frequency = 96),series="Temp(°C)")
+
+```
+```{r}
+power_train=window(ts(data$power, frequency = 96),start=c(1,1),end=c(51,96)) 
+power_test=window(ts(data$power, frequency = 96),start=c(52,1))
+
+# Covariates : Temp 
+temp_train=window(ts(data$`Temp (C°)`, frequency = 96),start=c(1,1),end=c(51,96)) 
+temp_test=window(ts(data$`Temp (C°)`, frequency = 96),start=c(52,1))
+
+```
+
+```{r}
+fit2=auto.arima(power_train,xreg=temp_train,seasonal = TRUE)
+prev=forecast(fit2,h=96,xreg=temp_test)
+autoplot(power_test,series="test data")+autolayer(prev$mean,series="predicted data")
+
+```
+```{r}
+cat('RMSE :',sqrt(mean((prev$mean-power_test)^2)))
+
+```
+```{r}
+summary(fit2)
+
+```
+
+```{r}
+checkresiduals(fit2)
+```
+There is still some autocorrelations and the auto model only took the D as the seasonal part but doesn't have and AR or MA seasonal part. Let’s have a look at the relationship between Power and Temperature
+```{r}
+plot(temp_train,power_train)
+```
+There are 2 “bands” (day/night) + a non-linear relationship with temperature. As a result, a simple linear term Temp is unlikely to be significant.
+```{r}
+temp_ts  <- ts(data$`Temp (C°)`,   frequency = 96)
+# Covariates : Temp + Temp^2 
+X_all   <- cbind(temp = temp_ts, temp2 = temp_ts^2)    
+temp_trainX <- window(X_all, start = c(1,1),  end = c(51,96))
+temp_testX  <- window(X_all, start = c(52,1)) 
+
+fit3=auto.arima(power_train,xreg=temp_trainX,seasonal = TRUE)
+prev3=forecast(fit3,h=96,xreg=temp_testX)
+autoplot(power_test,series="test data")+autolayer(prev$mean,series="predicted data")
+
+
+
+```
+```{r}
+summary(fit3)
+
+```
+```{r}
+acf(fit3$residuals)
+pacf(fit3$residuals)
+
+```
+
+Not really satisfying, we try to do a manual model.
+After comparing the metrics, we keep the first forecast.
+
+````{r}
+df <- data.frame(
+  date = time(prev$mean),           
+  value = as.numeric(prev$mean)     
+)
+
+# Save in CSV
+write.csv(df, "elec_2.csv", row.names = FALSE)
+
+````
